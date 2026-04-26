@@ -1,149 +1,131 @@
 import os
 import logging
-import asyncio
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import aiohttp
+import asyncio
 
-# --- НАСТРОЙКИ ---
-# Токен вашего бота из переменных окружения
+# Настройки
 TOKEN_BOT = os.environ.get("TOKEN_BOT")
-# ID лиги "La Liga" из базы OpenLigaDB
 LA_LIGA_LEAGUE_ID = 10
-# ID команды "Real Madrid" в этой лиге
 REAL_MADRID_TEAM_ID = 30
 
-# --- НАСТРОЙКА ЛОГГИРОВАНИЯ ---
+# Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- КОМАНДЫ БОТА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет приветственное сообщение."""
+    """Приветственное сообщение"""
     await update.message.reply_text(
         "⚽ **Hala Madrid!** ⚽\n\n"
-        "Я бот, который покажет расписание ближайших матчей Real Madrid.\n"
+        "Я покажу расписание ближайших матчей Real Madrid!\n"
         "Просто отправь команду /matches",
         parse_mode='Markdown'
     )
 
 async def get_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получает и отправляет список ближайших матчей."""
-    chat_id = update.effective_chat.id
-    loading_message = await update.message.reply_text("🔍 Ищу ближайшие матчи Real Madrid...")
-
-    # 1. Формируем URL для запроса к OpenLigaDB
-    # Эндпоинт возвращает все матчи для команды в указанном сезоне
-    # Сезон 2024 - это сезон 2024/2025
-    current_season = 2024
-    url = f"https://www.openligadb.de/api/getmatchesbyteamandseason/{REAL_MADRID_TEAM_ID}/{current_seASON}"
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    await loading_message.edit_text(f"❌ Ошибка при получении данных от API. Код ошибки: {resp.status}")
-                    return
-
-                all_matches = await resp.json()
-
-    except aiohttp.ClientError as e:
-        logger.error(f"Network error: {e}")
-        await loading_message.edit_text("❌ Не удалось подключиться к серверу с расписанием. Попробуйте позже.")
-        return
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        await loading_message.edit_text("❌ Произошла неизвестная ошибка.")
-        return
-
+    """Получение и отправка матчей"""
+    loading_msg = await update.message.reply_text("🔍 Ищу ближайшие матчи Real Madrid...")
+    
+    # Пробуем разные сезоны (2024, 2025, 2026)
+    seasons = [2026, 2025, 2024]
+    all_matches = []
+    
+    for season in seasons:
+        url = f"https://www.openligadb.de/api/getmatchesbyteamandseason/{REAL_MADRID_TEAM_ID}/{season}"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status == 200:
+                        matches = await resp.json()
+                        if matches:
+                            all_matches = matches
+                            logger.info(f"Найдено {len(matches)} матчей за сезон {season}")
+                            break
+                    else:
+                        logger.warning(f"Сезон {season}: статус {resp.status}")
+        except Exception as e:
+            logger.error(f"Ошибка при запросе сезона {season}: {e}")
+            continue
+    
     if not all_matches:
-        await loading_message.edit_text("❌ Не удалось найти расписание матчей для Real Madrid. Проверьте ID команды и лиги.")
+        await loading_msg.edit_text("❌ Не удалось найти матчи Real Madrid. Попробуйте позже.")
         return
-
-    # 2. Фильтруем и форматируем матчи
-    today = datetime.now(timezone.utc).date()
+    
+    # Фильтруем будущие матчи
+    now = datetime.now(timezone.utc)
     upcoming_matches = []
-
+    
     for match in all_matches:
-        # Парсим дату матча из строки формата "2025-05-04T16:15:00"
         match_date_str = match.get('MatchDateTimeUTC')
         if not match_date_str:
             continue
-
+            
         try:
-            # Преобразуем строку в объект datetime
-            match_datetime = datetime.fromisoformat(match_date_str.replace('Z', '+00:00'))
-            match_date = match_datetime.date()
-        except (ValueError, TypeError):
-            logger.warning(f"Не удалось распарсить дату: {match_date_str}")
+            match_date = datetime.fromisoformat(match_date_str.replace('Z', '+00:00'))
+            if match_date > now:
+                # Определяем место проведения
+                team1 = match['Team1']['TeamName']
+                team2 = match['Team2']['TeamName']
+                is_home = (team1 == "Real Madrid")
+                
+                upcoming_matches.append({
+                    'date': match_date,
+                    'is_home': is_home,
+                    'opponent': team2 if is_home else team1,
+                    'league': "La Liga",
+                    'venue': "Santiago Bernabéu" if is_home else "В гостях"
+                })
+        except Exception as e:
+            logger.error(f"Ошибка парсинга даты: {e}")
             continue
-
-        # Оставляем только будущие матчи
-        if match_date >= today:
-            # Получаем названия команд
-            team1_name = match['Team1']['TeamName']
-            team2_name = match['Team2']['TeamName']
-
-            # Определяем, где играет Реал Мадрид: дома или в гостях
-            is_home = (team1_name == "Real Madrid")
-            opponent = team2_name if is_home else team1_name
-            location = "🏠 **ДОМА**" if is_home else "✈️ **В ГОСТЯХ**"
-
-            # Формируем запись о матче
-            match_info = {
-                'date': match_datetime,
-                'location': location,
-                'opponent': opponent,
-                'league': "La Liga",  # Название лиги, можно уточнить
-                'venue': "Santiago Bernabéu" if is_home else "Стадион соперника"
-            }
-            upcoming_matches.append(match_info)
-
-    # Берем только ближайшие 5 матчей
+    
     upcoming_matches = upcoming_matches[:5]
-
+    
     if not upcoming_matches:
-        await loading_message.edit_text("📭 На данный момент нет запланированных ближайших матчей.")
+        await loading_msg.edit_text("📭 На данный момент нет запланированных матчей.")
         return
-
-    # 3. Собираем итоговое сообщение
-    result_message = "⚽ **БЛИЖАЙШИЕ МАТЧИ REAL MADRID** ⚽\n\n"
-
+    
+    # Формируем сообщение
+    message = "⚽ **БЛИЖАЙШИЕ МАТЧИ REAL MADRID** ⚽\n\n"
+    message += f"📅 {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC\n\n"
+    
     for i, match in enumerate(upcoming_matches, 1):
-        match_date = match['date']
-        location = match['location']
-        opponent = match['opponent']
-        league = match['league']
-        venue = match['venue']
+        location = "🏠 **ДОМА**" if match['is_home'] else "✈️ **В ГОСТЯХ**"
+        date_str = match['date'].strftime('%d %B %Y, %H:%M')
+        
+        message += f"**Матч #{i}**\n"
+        message += f"🏆 {match['league']}\n"
+        message += f"📅 {date_str} UTC\n"
+        message += f"{location} vs **{match['opponent']}**\n"
+        message += f"📍 {match['venue']}\n\n"
+    
+    message += "💪 **¡HALA MADRID!**"
+    
+    await loading_msg.edit_text(message, parse_mode='Markdown')
+    logger.info("✅ Матчи отправлены")
 
-        result_message += f"**Матч #{i}**\n"
-        result_message += f"🏆 {league}\n"
-        result_message += f"📅 {match_date.strftime('%d %B %Y, %H:%M')} UTC\n"
-        result_message += f"{location} vs **{opponent}**\n"
-        result_message += f"📍 {venue}\n\n"
-
-    result_message += "💪 **¡HALA MADRID!**"
-
-    await loading_message.edit_text(result_message, parse_mode='Markdown')
-
-# --- ЗАПУСК БОТА ---
 def main():
-    """Запускает бота."""
+    """Запуск бота"""
     if not TOKEN_BOT:
-        logger.error("❌ Ошибка: переменная окружения TOKEN_BOT не установлена!")
+        logger.error("❌ Токен бота не найден!")
         return
-
+    
     # Создаем приложение
     application = Application.builder().token(TOKEN_BOT).build()
-
-    # Регистрируем обработчики команд
+    
+    # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("matches", get_matches))
-
-    # Запускаем бота
-    logger.info("🚀 Бот запускается...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Запускаем бота с принудительным сбросом вебхука
+    logger.info("🚀 Запуск бота...")
+    application.run_polling(
+        drop_pending_updates=True,  # Сбрасываем старые обновления
+        allowed_updates=Update.ALL_TYPES
+    )
 
 if __name__ == '__main__':
     main()
