@@ -14,7 +14,8 @@ API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY")
 PORT = int(os.environ.get("PORT", 8080))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-REAL_MADRID_ID = 541
+# Разные возможные ID для Real Madrid
+REAL_MADRID_IDS = [541, 282, 555]  # 541 - основной, 282 - возможно для лиги, 555 - резервный
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -24,6 +25,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - показать это сообщение",
         parse_mode='Markdown'
     )
+
+async def find_real_madrid_id(session):
+    """Найти правильный ID Real Madrid в API"""
+    url = "https://v3.football.api-sports.io/teams"
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    params = {"search": "Real Madrid"}
+    
+    try:
+        async with session.get(url, headers=headers, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                teams = data.get("response", [])
+                for team in teams:
+                    if "Real Madrid" in team['team']['name']:
+                        logger.info(f"Найден Real Madrid: ID={team['team']['id']}, Name={team['team']['name']}")
+                        return team['team']['id']
+    except Exception as e:
+        logger.error(f"Ошибка поиска ID: {e}")
+    return REAL_MADRID_IDS[0]  # возвращаем ID по умолчанию
 
 async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loading_msg = await update.message.reply_text("⚽ Загружаю расписание матчей Real Madrid...")
@@ -39,55 +59,155 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
+            # Найдем правильный ID Real Madrid
+            real_madrid_id = await find_real_madrid_id(session)
+            
+            # Получаем текущую дату
+            today = datetime.now().date()
+            
+            # Пробуем разные подходы для получения матчей
+            fixtures = []
+            
+            # Способ 1: через параметр next
             url = "https://v3.football.api-sports.io/fixtures"
             headers = {"x-apisports-key": API_FOOTBALL_KEY}
-            params = {
-                "team": REAL_MADRID_ID,
-                "next": 5,
-                "season": str(datetime.now().year)
-            }
             
-            async with session.get(url, headers=headers, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    fixtures = data.get("response", [])
-                    
-                    if not fixtures:
-                        await loading_msg.edit_text("❌ Нет ближайших матчей")
+            # Пробуем разные параметры
+            params_list = [
+                {"team": real_madrid_id, "next": "10"},  # следующий 10 матчей
+                {"team": real_madrid_id, "season": "2024"},  # сезон 2024
+                {"team": real_madrid_id, "season": "2025"},  # сезон 2025
+                {"team": real_madrid_id, "from": today.isoformat()},  # с сегодняшней даты
+                {"team": real_madrid_id},  # все матчи
+            ]
+            
+            for params in params_list:
+                logger.info(f"Пробуем параметры: {params}")
+                async with session.get(url, headers=headers, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("response"):
+                            fixtures = data["response"]
+                            logger.info(f"Найдено {len(fixtures)} матчей с параметрами {params}")
+                            break
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Ошибка API ({params}): {response.status} - {error_text}")
+            
+            # Фильтруем только будущие матчи
+            today = datetime.now()
+            future_fixtures = []
+            for fixture in fixtures:
+                match_date_str = fixture['fixture']['date'].replace('Z', '+00:00')
+                match_date = datetime.fromisoformat(match_date_str)
+                if match_date > today:
+                    future_fixtures.append(fixture)
+            
+            fixtures = future_fixtures[:5]  # берем только 5 ближайших
+            
+            if not fixtures:
+                # Если матчей нет, показываем последние результаты
+                params = {"team": real_madrid_id, "last": "5"}
+                async with session.get(url, headers=headers, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("response"):
+                            await show_last_matches(loading_msg, data["response"])
+                            return
+                    else:
+                        await loading_msg.edit_text(
+                            "❌ **Нет ближайших матчей**\n\n"
+                            "Возможные причины:\n"
+                            "• Межсезонье\n"
+                            "• Расписание еще не опубликовано\n"
+                            "• Проблемы с API\n\n"
+                            f"ID Real Madrid в API: {real_madrid_id}",
+                            parse_mode='Markdown'
+                        )
                         return
-                    
-                    message = "⚽ **БЛИЖАЙШИЕ МАТЧИ REAL MADRID** ⚽\n\n"
-                    message += f"📅 Данные: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-                    
-                    for i, fixture in enumerate(fixtures, 1):
-                        match_date = datetime.fromisoformat(fixture['fixture']['date'].replace('Z', '+00:00'))
-                        
-                        home_team = fixture['teams']['home']['name']
-                        away_team = fixture['teams']['away']['name']
-                        is_home = (home_team == "Real Madrid")
-                        location = "🏠 ДОМА" if is_home else "✈️ В ГОСТЯХ"
-                        opponent = away_team if is_home else home_team
-                        
-                        league = fixture['league']['name']
-                        venue = fixture['fixture']['venue']['name']
-                        
-                        message += f"**Матч #{i}**\n"
-                        message += f"🏆 {league}\n"
-                        message += f"📅 {match_date.strftime('%d %B %Y %H:%M')} UTC\n"
-                        message += f"{location} vs **{opponent}**\n"
-                        message += f"📍 {venue}\n\n"
-                    
-                    message += "💪 **¡HALA MADRID!**"
-                    
-                    await loading_msg.edit_text(message, parse_mode='Markdown')
-                    logger.info("✅ Матчи отправлены")
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Ошибка API: {response.status} - {error_text}")
-                    await loading_msg.edit_text(f"❌ Ошибка API: {response.status}")
+            
+            # Формируем сообщение с матчами
+            message = "⚽ **БЛИЖАЙШИЕ МАТЧИ REAL MADRID** ⚽\n\n"
+            message += f"📅 Данные: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+            
+            for i, fixture in enumerate(fixtures, 1):
+                match_date = datetime.fromisoformat(fixture['fixture']['date'].replace('Z', '+00:00'))
+                
+                home_team = fixture['teams']['home']['name']
+                away_team = fixture['teams']['away']['name']
+                is_home = (home_team == "Real Madrid")
+                location = "🏠 **ДОМА**" if is_home else "✈️ **В ГОСТЯХ**"
+                opponent = away_team if is_home else home_team
+                
+                league = fixture['league']['name']
+                venue = fixture['fixture']['venue']['name']
+                status = fixture['fixture']['status']['long']
+                
+                message += f"**Матч #{i}**\n"
+                message += f"🏆 {league}\n"
+                message += f"📅 {match_date.strftime('%d %B %Y %H:%M')} UTC\n"
+                message += f"{location} vs **{opponent}**\n"
+                message += f"📍 {venue}\n"
+                if status != "Not Started":
+                    message += f"📊 Статус: {status}\n"
+                message += "\n"
+            
+            message += "💪 **¡HALA MADRID!**"
+            
+            await loading_msg.edit_text(message, parse_mode='Markdown')
+            logger.info("✅ Матчи отправлены")
+            
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await loading_msg.edit_text("❌ Ошибка при получении данных")
+        logger.error(f"Ошибка: {e}", exc_info=True)
+        await loading_msg.edit_text(
+            f"❌ **Ошибка при получении данных**\n\n"
+            f"Текст ошибки: {str(e)[:200]}\n\n"
+            f"Проверьте логи для деталей.",
+            parse_mode='Markdown'
+        )
+
+async def show_last_matches(loading_msg, fixtures):
+    """Показать последние матчи, если нет будущих"""
+    message = "📊 **ПОСЛЕДНИЕ МАТЧИ REAL MADRID** 📊\n\n"
+    message += f"📅 Данные: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+    
+    for i, fixture in enumerate(fixtures[:5], 1):
+        match_date = datetime.fromisoformat(fixture['fixture']['date'].replace('Z', '+00:00'))
+        
+        home_team = fixture['teams']['home']['name']
+        away_team = fixture['teams']['away']['name']
+        goals_home = fixture['goals']['home']
+        goals_away = fixture['goals']['away']
+        
+        is_home = (home_team == "Real Madrid")
+        opponent = away_team if is_home else home_team
+        location = "🏠 дома" if is_home else "✈️ в гостях"
+        
+        result = f"{goals_home} - {goals_away}"
+        if is_home:
+            madrid_goals = goals_home
+            opponent_goals = goals_away
+        else:
+            madrid_goals = goals_away
+            opponent_goals = goals_home
+        
+        if madrid_goals > opponent_goals:
+            emoji = "✅ **ПОБЕДА**"
+        elif madrid_goals < opponent_goals:
+            emoji = "❌ **ПОРАЖЕНИЕ**"
+        else:
+            emoji = "🤝 **НИЧЬЯ**"
+        
+        message += f"**Матч #{i}** - {emoji}\n"
+        message += f"📅 {match_date.strftime('%d %B %Y')}\n"
+        message += f"{location} vs **{opponent}**\n"
+        message += f"📊 Счет: **{result}**\n\n"
+    
+    message += "\n⚠️ **Нет запланированных матчей**\n"
+    message += "Показаны последние результаты.\n\n"
+    message += "💪 **¡HALA MADRID!**"
+    
+    await loading_msg.edit_text(message, parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Ошибка: {context.error}")
@@ -122,7 +242,7 @@ async def main():
             logger.info(f"✅ Вебхук установлен: {webhook_url}")
             
             # Создаем веб-сервер
-            app = web.Application()
+            web_app = web.Application()
             
             async def webhook_handler(request):
                 try:
@@ -137,11 +257,11 @@ async def main():
             async def health_handler(request):
                 return web.Response(text="OK")
             
-            app.router.add_post('/webhook', webhook_handler)
-            app.router.add_get('/health', health_handler)
-            app.router.add_get('/', health_handler)
+            web_app.router.add_post('/webhook', webhook_handler)
+            web_app.router.add_get('/health', health_handler)
+            web_app.router.add_get('/', health_handler)
             
-            runner = web.AppRunner(app)
+            runner = web.AppRunner(web_app)
             await runner.setup()
             site = web.TCPSite(runner, '0.0.0.0', PORT)
             await site.start()
