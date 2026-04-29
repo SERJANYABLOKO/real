@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: real-madrid-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    envVars:
+      - key: TOKEN_BOT
+        sync: false
